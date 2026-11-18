@@ -6,7 +6,7 @@ Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model),
 The assignment is in [project-description.md](project-description.md).
 
 > This README is written step by step while the project is built. Each section below documents one step: what was done, why, and what came out.
-> **Status:** step 1 (exploration) done. Next: data pipeline, then model training, then API.
+> **Status:** step 1 (exploration) and step 2 (data pipeline + tests) done. Next: model training, then API.
 
 ## Setup
 
@@ -22,11 +22,21 @@ Open notebooks with the kernel from `.venv/` that `uv sync` creates.
 
 ```
 data/raw/               downloaded parquet files, never edited (ignored by git)
+data/processed/         cleaned features + target, written by the pipeline (ignored by git)
 notebooks/
   01_explore_yellow_taxi.ipynb   exploration only, not part of the pipeline
-src/                    (planned) data pipeline, features, training
+src/taxi_ml/
+  config.py             paths, URL, month, cleaning thresholds, feature list (settings only)
+  data.py               download_month() and load_raw()
+  clean.py              add_duration() and clean(): the target and the row filters
+  features.py           build_features(): raw columns -> model features (shared with the API)
+  pipeline.py           build_dataset() and run(): all stages in order
 app/                    (planned) FastAPI app
-tests/                  (planned)
+tests/
+  conftest.py           small raw-like test frame where each bad row breaks one rule
+  test_clean.py         unit tests for the cleaning rules
+  test_features.py      unit tests for feature building
+  test_pipeline.py      integration tests: load, download-skip, full run on a parquet file
 ```
 
 This table is updated whenever a file is added.
@@ -69,15 +79,37 @@ Not used: `tpep_dropoff_datetime` (it defines the target), and all fare, tip, to
 
 **Limitation to document in the results:** `trip_distance` is measured by the meter during the trip, so strictly it is not known at pickup. It is the strongest predictor, so the baseline uses it, but the final write-up should say so, and the model can be compared against a version without it.
 
-## Reproduce the exploration
+### Step 2: Data pipeline (`src/taxi_ml/`) and tests
+
+The notebook's decisions are now code. The flow is `download -> load -> clean -> features -> data/processed/yellow_2025-01_clean.parquet`.
 
 ```bash
-uv sync
-mkdir -p data/raw
-curl -L -o data/raw/yellow_tripdata_2025-01.parquet https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2025-01.parquet
+uv run python -m taxi_ml.pipeline   # download (skipped if present), clean, write the processed file
+uv run pytest                       # 22 tests
 ```
 
-Then run `notebooks/01_explore_yellow_taxi.ipynb`. (Step 2 replaces the manual download with a pipeline step.)
+**Result on January 2025:** 3,475,226 raw rows -> **3,339,084 rows kept (96.1%)**. The processed file has the 6 features plus `duration`, no missing values, durations from 1 to 60 minutes. (The notebook's 82.1% figure dropped rows with a missing `passenger_count`; the pipeline keeps and fills them.)
+
+**Design decisions**
+
+| Decision | Why |
+|---|---|
+| `clean.py` and `features.py` are pure functions (DataFrame in, DataFrame out), with no paths or downloads | Easy to unit test with tiny frames, and the API can import `build_features` unchanged |
+| `config.py` holds every threshold and the feature list | One place to change a rule, and training and API cannot disagree |
+| Missing `passenger_count` is filled with the constant `1` in `build_features`, not with the data's median | A constant gives the same result in training and in the API; a median computed from the data would have to be saved and loaded |
+| The month window is a filter on the pickup time, not on the file name | The January file contains 22 trips from neighbouring months |
+| Download writes a `.part` file and renames it when complete; an existing file is skipped | A failed download never looks like a good file, and re-running is safe |
+| `build_dataset()` (pure) is separate from `run()` (file access) | The integration test can check the logic without touching `data/` |
+| No Prefect or Docker in the pipeline | One month on one machine; not needed for this task |
+
+**Cleaning rules** (thresholds in `config.py`): pickup in `[2025-01-01, 2025-02-01)`; duration 1 to 60 minutes inclusive; distance above 0 and at most 100 miles. Nothing else is dropped.
+
+**Tests**
+
+- *Unit* (`test_clean.py`, `test_features.py`): each cleaning rule has its own test on a small frame where one row breaks exactly that rule, including the boundary (exactly 60 minutes is kept), a trip crossing midnight, the empty frame, and that inputs are not modified. Feature tests check the column order, hour/weekday, the passenger fill, and that no after-the-trip column (dropoff time, `total_amount`, `duration`) can leak into the features.
+- *Integration* (`test_pipeline.py`): reads a real parquet file, checks the clear error for a missing file, that an existing file is not downloaded again (the URL is unreachable on purpose), that `build_dataset` returns matching `X` and `y`, and that `run()` writes the processed file with the right columns.
+- Checked that the tests can fail: changing the maximum duration from 60 to 61 makes 4 tests fail.
+- The real download over the network is not covered by a test (it would need the network or a mocked HTTP response).
 
 ## Questions from the assignment
 
