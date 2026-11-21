@@ -6,7 +6,7 @@ Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model),
 The assignment is in [project-description.md](project-description.md).
 
 > This README is written step by step while the project is built. Each section below documents one step: what was done, why, and what came out.
-> **Status:** step 1 (exploration), step 2 (data pipeline + tests) and step 3 (baseline training, RMSE, MLflow) done. Next: build the API, then the stretch tasks.
+> **Status:** step 1 (exploration), step 2 (data pipeline + tests) and step 3 (baseline training, RMSE, MLflow) and step 4 (behavioral tests) done. Next: build the API, then the stretch tasks.
 
 ## Setup
 
@@ -34,13 +34,17 @@ src/taxi_ml/
   features.py           build_features(): raw columns -> model features (shared with the API)
   pipeline.py           build_dataset() and run(): all stages in order
   train.py              split, baseline RandomForestRegressor, RMSE, MLflow logging
+  registry.py           latest_run_id() and load_latest_model(): find and load the trained model from MLflow
 app/                    (planned) FastAPI app
 tests/
   conftest.py           small raw-like test frame where each bad row breaks one rule
+  helpers.py            shared test data (make_processed) and small model settings
   test_clean.py         unit tests for the cleaning rules
   test_features.py      unit tests for feature building
   test_pipeline.py      integration tests: load, download-skip, full run on a parquet file
   test_train.py         unit tests (split, RMSE, model) and integration tests (a run logged to a temporary MLflow)
+  test_registry.py      finding and loading the newest model
+  test_model_behavior.py  behavioral tests (MFT, INV, DIR) of the real trained model
 ```
 
 This table is updated whenever a file is added.
@@ -89,7 +93,7 @@ The notebook's decisions are now code. The flow is `download -> load -> clean ->
 
 ```bash
 uv run python -m taxi_ml.pipeline   # download (skipped if present), clean, write the processed file
-uv run pytest                       # all tests (42 after step 3)
+uv run pytest                       # all tests (62 after step 4)
 ```
 
 **Result on January 2025:** 3,475,226 raw rows -> **3,338,899 rows kept (96.1%)**. The processed file has the 6 features plus `duration`, no missing values, durations from 1 to 60 minutes. (The notebook's 82.1% figure dropped rows with a missing `passenger_count`; the pipeline keeps and fills them.)
@@ -178,6 +182,35 @@ The model's typical error is about 4 minutes on trips with a median of 11.7 minu
 **Tests** (`tests/test_train.py`, 17 tests): the split has the right sizes, no overlap, aligned features and target, and is reproducible; RMSE matches a hand calculation; the model is fitted, takes parameter overrides and beats the mean predictor on data where duration depends on distance; the full `run()` logs the expected parameters and metrics to a temporary MLflow, creates the database and model files in the folder it was given, puts two runs in one experiment, and the logged model can be loaded and predicts. A missing processed file gives an error that points to the pipeline.
 
 **Not done yet:** keeping vs dropping the rows with a missing `passenger_count` (compare both on the same validation rows), a version without `trip_distance`, feature importances, and a time-based split.
+
+### Step 4: Behavioral tests of the trained model (`tests/test_model_behavior.py`)
+
+The other tests check the **code**. These check the **model**: does it behave like a taxi trip? They follow the three kinds from the course (behavioral testing, "CheckList" style):
+
+| Kind | Idea | Tests here |
+|---|---|---|
+| **Minimum functionality (MFT)** | Simple cases with an obvious answer | A 0.3-mile trip is predicted under 10 min; a 20-mile trip over 25 min; a 10-mile trip at least 10 min longer than a 0.5-mile trip; all predictions stay in the 1 to 60 min range the model was trained on; every hour/weekday combination and extreme inputs (distance 0.01 and 100, locations 1 and 265, 0 or 6 passengers) give a valid number |
+| **Invariance (INV)** | A change that should **not** matter must not change the prediction | Changing `passenger_count` from 1 to 2, 3 or 4 changes predictions by less than 0.5 min on average (95% of trips under 1 min); the same input gives the same output |
+| **Directional expectation (DIR)** | A change that should push the prediction one way | A 50% longer distance does not shorten the trip (at least 95% of 5,000 trips, and clearly longer on average); predictions rise step by step with distance (0.5 to 15 miles); 5 pm is slower than 3 am (at least 90% of trips); a Sunday at 5 pm is not slower than a Thursday at 5 pm |
+
+```bash
+uv run pytest tests/test_model_behavior.py -v      # only the behavioral tests
+uv run pytest -m "not behavior"                    # everything except them
+```
+
+**How they work**
+- They test the **newest model in MLflow**, loaded with `registry.load_latest_model()`. When a tuned model is trained later, the same tests judge it, so they act as a quality gate before serving. They are skipped with a reason (not failed) if no model or no processed data exists yet.
+- Starting points are 5,000 real trips sampled from the processed data; each test changes one thing and compares predictions before and after.
+- A Random Forest is not smooth, so a single pair of trips can break a direction by chance. The DIR and INV tests therefore check **shares and averages**, not every single trip.
+- Tolerances come from reasoning, not from the model's output: for example the passenger tolerance of 0.5 min is about an eighth of the model's 4 min RMSE. I measured the baseline first (a passenger change moves predictions by 0.02 min on average; 99.2% of trips are slower at 5 pm than at 3 am, by 4.9 min on average) and the tolerances leave room for a retrained model.
+
+**Checked that these tests can fail.** I trained two deliberately broken models and ran the tests against them: one learned from shuffled durations (7 tests failed: the obvious-answer and directional ones) and one whose duration depended only on passenger count (10 failed, including all three invariance tests). The tests that stayed green for the shuffled model are pure sanity checks (valid range, finite numbers, passenger count irrelevant), which is expected.
+
+**Findings and decisions**
+- Repeating a prediction is not bit-identical: differences of about 1e-14 minutes appear because the forest adds its trees in parallel threads (`n_jobs=-1`). With one thread the result is identical. The test therefore uses a tolerance of 1e-9 instead of exact equality. This is floating-point noise, not a model problem.
+- The prediction for a trip in the Midtown to Upper East Side example is flat from about 20 miles on (48 min for both 20 and 30 miles), because training trips are capped at 60 minutes and few are that long. The tests only require "long", not growth beyond that.
+- **Not tested on purpose:** swapping pickup and dropoff zone. Predictions differ by 0.9 min on average, which is plausible (one-way streets, traffic direction), so it is not an invariance.
+- The behavioral tests read the local `mlflow.db`. A fresh clone has no model, so they are skipped until `uv run python -m taxi_ml.train` has been run.
 
 ## Questions from the assignment
 
