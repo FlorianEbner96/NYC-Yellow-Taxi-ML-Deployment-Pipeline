@@ -30,6 +30,7 @@ packages = ["src/taxi_ml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # lets the tests import the app/ package from the project root
 markers = ["behavior: behavioral tests of the trained model (need a trained model, see tests/test_model_behavior.py)"]
 
 [dependency-groups]

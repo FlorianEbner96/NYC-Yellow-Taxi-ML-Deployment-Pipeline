@@ -14,6 +14,11 @@ MONTH = 1
 MIN_DURATION_MIN = 1
 MAX_DURATION_MIN = 60
 MAX_DISTANCE_MILES = 100
+# API input limits (the API only accepts what the model was trained on)
+MIN_PASSENGERS = 1
+MAX_PASSENGERS = 6
+MAX_LOCATION_ID = 265  # TLC taxi zones are numbered 1 to 265
+
 MAX_SPEED_MPH = 80  # faster is physically impossible in the city: wrong distance or timestamps
 
 # Rows with a missing passenger_count are kept and filled with this constant.
@@ -42,6 +47,9 @@ EXPERIMENT_NAME = "yellow-taxi-duration"
 # MLflow saves sklearn models with skops, which refuses unknown types. Every tree model contains
 # this one; we train and load our own models, so we trust exactly this type and nothing else.
 SKOPS_TRUSTED_TYPES = ["sklearn.tree._tree.Tree"]
+# Model Registry: the API serves whichever version the "production" alias points at.
+REGISTERED_MODEL_NAME = "yellow-taxi-duration"
+PRODUCTION_ALIAS = "production"
 
 PICKUP_COL ="tpep_pickup_datetime"
 DROPOFF_COL = "tpep_dropoff_datetime"

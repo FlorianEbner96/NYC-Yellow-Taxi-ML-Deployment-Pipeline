@@ -5,9 +5,10 @@ Three kinds, as in the course material:
   * Invariance tests (INV): a change that should NOT matter must not change the prediction much.
   * Directional expectation tests (DIR): a change that should push the prediction one way.
 
-The model is the newest run in the local MLflow store, so these tests guard whatever model was
-trained last (baseline now, tuned model later). They are skipped, with a reason, if no model or
-no processed data exists. Set TAXI_TEST_MLFLOW_DIR to test a model stored somewhere else.
+By default the model is the newest run in the local MLflow store, so these tests judge a fresh
+candidate before it is promoted (baseline now, tuned model later). They are skipped, with a reason, if no model or
+no processed data exists. Set TAXI_TEST_MODEL=production to test the promoted model instead of the
+newest run, and TAXI_TEST_MLFLOW_DIR to use a store somewhere else.
 
 A Random Forest is not smooth, so single pairs of trips can break a direction by chance.
 Directional tests therefore check the share of 5,000 sampled trips, not every trip.
@@ -21,7 +22,7 @@ import pandas as pd
 import pytest
 
 from taxi_ml.config import FEATURES, MAX_DURATION_MIN, MIN_DURATION_MIN, MLFLOW_DIR, PROCESSED_DIR, PROCESSED_NAME
-from taxi_ml.registry import load_latest_model
+from taxi_ml.registry import load_latest_model, load_production_model
 
 pytestmark = pytest.mark.behavior
 
@@ -32,8 +33,9 @@ CONTEXT = {"pickup_hour": 14, "pickup_weekday": 1, "PULocationID": 161, "DOLocat
 @pytest.fixture(scope="module")
 def model():
     mlflow_dir = Path(os.environ.get("TAXI_TEST_MLFLOW_DIR", MLFLOW_DIR))
+    load = load_production_model if os.environ.get("TAXI_TEST_MODEL") == "production" else load_latest_model
     try:
-        return load_latest_model(mlflow_dir)
+        return load(mlflow_dir)
     except FileNotFoundError as error:
         pytest.skip(str(error))
 

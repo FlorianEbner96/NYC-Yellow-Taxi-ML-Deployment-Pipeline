@@ -6,7 +6,7 @@ Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model),
 The assignment is in [project-description.md](project-description.md).
 
 > This README is written step by step while the project is built. Each section below documents one step: what was done, why, and what came out.
-> **Status:** step 1 (exploration), step 2 (data pipeline + tests) and step 3 (baseline training, RMSE, MLflow) and step 4 (behavioral tests) done. Next: build the API, then the stretch tasks.
+> **Status:** done: exploration, data pipeline, baseline training with MLflow, behavioral tests, model promotion, and the API (steps 1 to 6). Next: the stretch tasks (hyperparameter tuning, keep-vs-drop experiment), then the final answers.
 
 ## Setup
 
@@ -23,7 +23,7 @@ Open notebooks with the kernel from `.venv/` that `uv sync` creates.
 ```
 data/raw/               downloaded parquet files, never edited (ignored by git)
 data/processed/         cleaned features + target, written by the pipeline (ignored by git)
-mlflow.db               MLflow runs, params and metrics (SQLite, ignored by git)
+mlflow.db               MLflow runs, metrics and the model registry (SQLite, ignored by git)
 mlartifacts/            logged models (ignored by git)
 notebooks/
   01_explore_yellow_taxi.ipynb   exploration only, not part of the pipeline
@@ -34,8 +34,12 @@ src/taxi_ml/
   features.py           build_features(): raw columns -> model features (shared with the API)
   pipeline.py           build_dataset() and run(): all stages in order
   train.py              split, baseline RandomForestRegressor, RMSE, MLflow logging
-  registry.py           latest_run_id() and load_latest_model(): find and load the trained model from MLflow
-app/                    (planned) FastAPI app
+  registry.py           load_latest_model() (newest run) and load_production_model() (promoted version)
+  promote.py            best_run() and promote(): register the best run, point the 'production' alias at it
+app/
+  schemas.py            request and response models with the allowed ranges (Pydantic)
+  main.py               create_app(): /health and /predict, loads the production model once at start-up
+sample-request.json     example body for /predict
 tests/
   conftest.py           small raw-like test frame where each bad row breaks one rule
   helpers.py            shared test data (make_processed) and small model settings
@@ -43,7 +47,9 @@ tests/
   test_features.py      unit tests for feature building
   test_pipeline.py      integration tests: load, download-skip, full run on a parquet file
   test_train.py         unit tests (split, RMSE, model) and integration tests (a run logged to a temporary MLflow)
-  test_registry.py      finding and loading the newest model
+  test_registry.py      finding and loading the newest and the promoted model
+  test_promote.py       choosing and promoting the best run
+  test_api.py           API tests with a stand-in model, plus one smoke test with the real model
   test_model_behavior.py  behavioral tests (MFT, INV, DIR) of the real trained model
 ```
 
@@ -93,7 +99,7 @@ The notebook's decisions are now code. The flow is `download -> load -> clean ->
 
 ```bash
 uv run python -m taxi_ml.pipeline   # download (skipped if present), clean, write the processed file
-uv run pytest                       # all tests (62 after step 4)
+uv run pytest                       # all tests (103 after step 6)
 ```
 
 **Result on January 2025:** 3,475,226 raw rows -> **3,338,899 rows kept (96.1%)**. The processed file has the 6 features plus `duration`, no missing values, durations from 1 to 60 minutes. (The notebook's 82.1% figure dropped rows with a missing `passenger_count`; the pipeline keeps and fills them.)
@@ -181,7 +187,7 @@ The model's typical error is about 4 minutes on trips with a median of 11.7 minu
 
 **Tests** (`tests/test_train.py`, 17 tests): the split has the right sizes, no overlap, aligned features and target, and is reproducible; RMSE matches a hand calculation; the model is fitted, takes parameter overrides and beats the mean predictor on data where duration depends on distance; the full `run()` logs the expected parameters and metrics to a temporary MLflow, creates the database and model files in the folder it was given, puts two runs in one experiment, and the logged model can be loaded and predicts. A missing processed file gives an error that points to the pipeline.
 
-**Not done yet:** keeping vs dropping the rows with a missing `passenger_count` (compare both on the same validation rows), a version without `trip_distance`, feature importances, and a time-based split.
+**Not done yet (after step 6):** keeping vs dropping the rows with a missing `passenger_count` (compare both on the same validation rows), a version without `trip_distance`, feature importances, and a time-based split.
 
 ### Step 4: Behavioral tests of the trained model (`tests/test_model_behavior.py`)
 
@@ -211,6 +217,81 @@ uv run pytest -m "not behavior"                    # everything except them
 - The prediction for a trip in the Midtown to Upper East Side example is flat from about 20 miles on (48 min for both 20 and 30 miles), because training trips are capped at 60 minutes and few are that long. The tests only require "long", not growth beyond that.
 - **Not tested on purpose:** swapping pickup and dropoff zone. Predictions differ by 0.9 min on average, which is plausible (one-way streets, traffic direction), so it is not an invariance.
 - The behavioral tests read the local `mlflow.db`. A fresh clone has no model, so they are skipped until `uv run python -m taxi_ml.train` has been run.
+
+### Step 5: Promote the best model (`src/taxi_ml/promote.py`, `registry.py`)
+
+Until now "the model" meant the newest run. That is unsafe for an API: a worse model trained tomorrow would be served without anyone deciding so. The MLflow **Model Registry** solves this: a model gets a name and numbered versions, and an **alias** (`production`) points at one version. The API loads `models:/yellow-taxi-duration@production`, and the alias only moves when someone promotes a model.
+
+```bash
+uv run python -m taxi_ml.promote     # pick the best run, register it, point 'production' at it
+```
+
+Example output on the three identical baseline runs:
+
+```
+compared 3 run(s):
+  -> 05c8eed9  baseline-random-forest  rmse_val 4.144
+     7a15022a  baseline-random-forest  rmse_val 4.144
+     cc176704  baseline-random-forest  rmse_val 4.144
+'production' now points to yellow-taxi-duration version 1 (rmse_val 4.144)
+```
+
+**Rules and decisions**
+
+| Decision | Why |
+|---|---|
+| "Best" = lowest `rmse_val`, **not** the newest run | A newer run can be worse (for example a tuning experiment that overfits). Tested: a worse newest run does not take over |
+| Promoting is a manual command, not part of training | A candidate should first pass the behavioral tests: `uv run pytest tests/test_model_behavior.py` judges the newest run, `TAXI_TEST_MODEL=production uv run pytest tests/test_model_behavior.py` judges the promoted one |
+| Promoting twice creates no duplicate version | If the best run is already registered, its existing version is reused and only the alias is set |
+| All compared runs are printed | "Best by RMSE" is only a fair comparison between runs with the same cleaning rules and the same validation split. If the duration cutoff changes, RMSE values are no longer comparable |
+| `registry.load_latest_model()` stays | It is how a fresh candidate is judged before promotion |
+| Clear errors | No database: "train first". No promoted model: "run `taxi_ml.promote`". Looking for a model never creates an empty database |
+
+**Caveat:** choosing the best of several runs by validation RMSE makes that RMSE slightly optimistic (there is no separate test set). With a handful of runs the effect is small.
+
+**Tests** (`test_promote.py`, 9; plus 5 new ones in `test_registry.py`): the lowest-RMSE run wins over a newer worse one, all candidates are listed and sorted, the alias points to the right run, version numbers, idempotence, a worse run does not take over production, a better run moves the alias to version 2, the promoted model loads by alias and differs from the newest run when that one is worse, and the error messages. One bug found by the tests: MLflow returns the version as a number, so `production_version()` converts it to text for the API.
+
+### Step 6: FastAPI prediction service (`app/`)
+
+```bash
+uv run uvicorn app.main:app --port 8000        # needs a promoted model (step 5)
+# interactive docs: http://127.0.0.1:8000/docs
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d @sample-request.json
+```
+
+On Windows PowerShell use `curl.exe` (plain `curl` is an alias for something else). With Python:
+
+```python
+import json, requests
+requests.post("http://127.0.0.1:8000/predict", json=json.load(open("sample-request.json"))).json()
+# {'predicted_duration_minutes': 17.49, 'model_version': '1'}
+```
+
+**Endpoints**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /predict` | Body: `pickup_datetime` (New York local time), `PULocationID`, `DOLocationID`, `trip_distance` (miles), optional `passenger_count` (default 1). Returns `predicted_duration_minutes` and the `model_version` that answered |
+| `GET /health` | `{"status": "ok", "model_version": "1"}` |
+
+**Input validation** (`app/schemas.py`, Pydantic): zone ids 1 to 265, passenger count 1 to 6 (whole numbers), distance above 0 and at most 100 miles, a valid date. Anything else gets a `422` that names the field, and the model is never called. Unknown fields are rejected too: a misspelled `passengers` would otherwise be silently ignored and the default used.
+
+**Design decisions**
+
+| Decision | Why |
+|---|---|
+| The API calls `features.build_features()`, the same function the training pipeline used | Training and serving cannot build features differently. A test sends the same trip through the pipeline and through the API and compares the features the model receives |
+| The model is loaded once, at start-up, from the `production` alias | Loading a 57 MB model per request would be slow. If there is no promoted model, the app refuses to start with a message instead of failing on every request |
+| `create_app(load_model)` takes the loader as a parameter | Tests use a stand-in model that records its input, so API behavior is tested without MLflow or a trained model |
+| The app lives in `app/` and imports `taxi_ml` | As in the suggested repository layout. `pythonpath = ["."]` in `pyproject.toml` lets the tests import it |
+| Local-first: plain `uvicorn`, no Docker | The assignment asks for one of the two; uvicorn is the simpler one |
+| No batch endpoint | Not required; one trip per request keeps the contract simple |
+
+**Limitation (same as in step 1):** `trip_distance` is only known once the trip is over (or estimated from the route), which is why the request needs it. A real service would take it from a routing estimate. The model without `trip_distance` has not been compared yet.
+
+**Verified by hand:** I started the server and sent requests with `curl` and Python `requests`. `/health` answered with version 1; the sample request predicted 17.49 minutes; distances of 0.5 / 2.4 / 10 / 20 miles gave 4.95 / 17.49 / 36.16 / 52.96 minutes (growing with distance); `passenger_count: 9` returned `422`.
+
+**Tests** (`tests/test_api.py`, 27): the happy path and response shape; the default passenger count; the edges of every valid range are accepted and values just outside are rejected; missing fields, wrong types, bad dates and unknown fields give `422` and never reach the model; the feature-equality test between pipeline and API; the app refuses to start without a model; the model is loaded once for several requests; and one smoke test with the real promoted model (skipped if none exists).
 
 ## Questions from the assignment
 

@@ -55,3 +55,55 @@ def test_asking_for_a_model_does_not_create_a_database(tmp_path):
         latest_run_id(empty)
     assert not (empty / "mlflow.db").exists()
 
+
+
+def test_load_production_model_returns_the_promoted_model_not_the_newest(tmp_path):
+    from taxi_ml.promote import promote
+    from taxi_ml.registry import load_production_model
+
+    path = tmp_path / "processed.parquet"
+    make_processed().to_parquet(path)
+    mlflow_dir = tmp_path / "mlflow"
+    good = {"n_estimators": 10, "min_samples_leaf": 2}
+    bad = {"n_estimators": 3, "min_samples_leaf": 150}
+    run(processed_path=path, mlflow_dir=mlflow_dir, params=good)
+    run(processed_path=path, mlflow_dir=mlflow_dir, params=bad)  # newest, but worse
+    promote(mlflow_dir)
+
+    X = make_processed(50)[FEATURES]
+    production = load_production_model(mlflow_dir).predict(X)
+    newest = load_latest_model(mlflow_dir).predict(X)
+    assert production.shape == (50,)
+    assert not (production == newest).all()  # a different model than the newest run
+
+
+def test_load_production_model_before_any_promotion_points_to_promote(trained):
+    from taxi_ml.registry import load_production_model
+
+    mlflow_dir, _ = trained
+    with pytest.raises(FileNotFoundError, match="taxi_ml.promote"):
+        load_production_model(mlflow_dir)
+
+
+def test_load_production_model_without_a_database_points_to_train(tmp_path):
+    from taxi_ml.registry import load_production_model
+
+    with pytest.raises(FileNotFoundError, match="taxi_ml.train"):
+        load_production_model(tmp_path / "empty")
+
+
+def test_production_version_is_the_version_number_of_the_promoted_model(trained):
+    from taxi_ml.promote import promote
+    from taxi_ml.registry import production_version
+
+    mlflow_dir, _ = trained
+    promote(mlflow_dir)
+    assert production_version(mlflow_dir) == "1"
+
+
+def test_production_version_before_any_promotion_points_to_promote(trained):
+    from taxi_ml.registry import production_version
+
+    mlflow_dir, _ = trained
+    with pytest.raises(FileNotFoundError, match="taxi_ml.promote"):
+        production_version(mlflow_dir)
