@@ -1,12 +1,67 @@
 # NYC Yellow Taxi: Trip Duration Model, from Data to API
 
-Train, track and locally serve a model that predicts the duration (in minutes) of New York City yellow taxi trips, using the January 2025 trip records.
+Predict how long (in minutes) a New York City yellow taxi trip takes, from the January 2025 trip records. The project covers the whole path: explore the data, build a tested cleaning pipeline, train and track a model, promote the best one, and serve it through a local API.
 
-Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model), `MLflow` (experiment tracking), `FastAPI` (serving).
-The assignment is in [project-description.md](project-description.md).
+Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model), `MLflow` (experiment tracking and model registry), `FastAPI` (serving), `pytest` (103 tests). The assignment is in [project-description.md](project-description.md).
 
-> This README is written step by step while the project is built. Each section below documents one step: what was done, why, and what came out.
-> **Status:** done: exploration, data pipeline, baseline training with MLflow, behavioral tests, model promotion, and the API (steps 1 to 6). Next: the stretch tasks (hyperparameter tuning, keep-vs-drop experiment), then the final answers.
+## Results at a glance
+
+| | |
+|---|---|
+| Data | January 2025 yellow taxi trips: 3,475,226 rows, 3,338,899 kept after cleaning (96.1%) |
+| Model | Random Forest, 50 trees, `min_samples_leaf=100` (57 MB) |
+| **Validation RMSE** | **4.14 minutes**; always predicting the average gives 9.77 |
+| Typical trip | median duration 11.7 minutes, so the error is about a third of a typical trip |
+| Serving | `POST /predict` on `http://127.0.0.1:8000`; the sample request predicts 17.49 minutes |
+| Tests | 103: cleaning rules, features, pipeline, training, model registry, API, and behavior of the trained model |
+| Not done | hyperparameter tuning (stretch task) and a few experiments, see [Open points](#open-points-and-what-i-would-do-differently) |
+
+The honest caveats are in [Trade-offs and limitations](#trade-offs-and-limitations). The most important one: the model uses `trip_distance`, which is only known when the trip ends.
+
+## Workflow
+
+```mermaid
+flowchart LR
+    A["Download<br>Jan 2025 data"] --> B["Explore<br>(notebook)"]
+    B --> C["Clean + features<br>(pipeline)"]
+    C --> D["Train Random Forest<br>RMSE, log to MLflow"]
+    D --> E["Behavioral tests<br>of the model"]
+    E --> F["Promote best run<br>(registry alias)"]
+    F --> G["Serve with FastAPI<br>/predict"]
+```
+
+## Quickstart
+
+```bash
+uv sync                                                                   # environment and packages
+uv run python -m taxi_ml.pipeline                                         # download, clean, features -> data/processed/
+uv run python -m taxi_ml.train                                            # train, evaluate, log to MLflow (about 20 s)
+uv run python -m taxi_ml.promote                                          # register the best run, set alias 'production'
+uv run uvicorn app.main:app --port 8000                                   # serve (docs: http://127.0.0.1:8000/docs)
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d @sample-request.json
+uv run pytest                                                             # all tests
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000      # optional: look at the runs
+```
+
+Everything runs from the terminal; no other program is needed (a browser only for the optional MLflow UI and the API docs). The data, `mlflow.db` and `mlartifacts/` are not committed, so a fresh clone needs the first four commands before the API can start. On Windows PowerShell use `curl.exe` instead of `curl`.
+
+## Where the assignment steps are
+
+| Assignment step | Where in this repo |
+|---|---|
+| 1. Load and inspect the data | Step 1, notebook |
+| 2. Clean training data, define the target | Step 2, `clean.py` |
+| 3. Train/validation split | Step 3, `train.split_data()` |
+| 4. Baseline Random Forest | Step 3, `train.train_baseline()` |
+| 5. RMSE and MLflow | Step 3, `train.run()` |
+| 6. Reusable modules for features and model loading | `features.py` (used by pipeline and API), `registry.py`; Step 5 |
+| 7. FastAPI with `/predict` | Step 6, `app/` |
+| 8. Run locally, send a request | Step 6 |
+| 9. Document results and trade-offs | this README |
+| Stretch: tests | Steps 2 to 6 (103 tests, including behavioral tests) |
+| Stretch: tuning and comparison | not done, see [Open points](#open-points-and-what-i-would-do-differently) |
+
+The step numbers in the log below are this README's own (the order I built things in), not the assignment's.
 
 ## Setup
 
@@ -16,7 +71,7 @@ Requirements: [uv](https://docs.astral.sh/uv/getting-started/installation/) and 
 uv sync
 ```
 
-Open notebooks with the kernel from `.venv/` that `uv sync` creates.
+Open the notebook with the kernel from `.venv/` that `uv sync` creates.
 
 ## Project structure
 
@@ -53,8 +108,6 @@ tests/
   test_model_behavior.py  behavioral tests (MFT, INV, DIR) of the real trained model
 ```
 
-This table is updated whenever a file is added.
-
 ## Log of steps
 
 ### Step 1: Data exploration (`notebooks/01_explore_yellow_taxi.ipynb`)
@@ -72,7 +125,7 @@ This table is updated whenever a file is added.
 | Duration has impossible and extreme values | min -51,472 min, max 5,626 min; 2,051 rows with `duration <= 0`, 40,111 under 1 min, 31,867 over 60 min, 20 over 24 h. Median 11.7 min, 99th percentile 58.9 min | Keep only trips of 1 to 60 minutes. Extremes would dominate the RMSE |
 | Distance has errors | 90,893 rows with distance 0, 162 over 100 miles (max 276,424) | Keep distance in (0, 100] miles |
 | Month window | 22 rows have a pickup outside January (21 in Dec 2024, 1 in Feb 2025) | Filter on the pickup date, as in the Green Taxi project |
-| One block of rows has five empty fields | `passenger_count`, `RatecodeID`, `store_and_fwd_flag`, `congestion_surcharge`, `Airport_fee` are all missing in the same 15.5% of rows (540,149) | Do **not** drop them, that would remove 16% of the data. Fill `passenger_count` with its median (1) |
+| One block of rows has five empty fields | `passenger_count`, `RatecodeID`, `store_and_fwd_flag`, `congestion_surcharge`, `Airport_fee` are all missing in the same 15.5% of rows (540,149) | Do **not** drop them, that would remove 16% of the data. Fill `passenger_count` with 1, the most common value (see step 2) |
 | Passenger count | 24,656 rows with 0 passengers, 18 with more than 6 | Kept for now (they do not make the duration wrong) |
 | Fares are unreliable | 145,516 rows with `fare_amount <= 0`, min -900 | Not used as features anyway (see leakage) |
 | Distance carries strong signal | correlation of distance and duration (1 to 120 min trips) is 0.81 | A baseline should already work well |
@@ -91,7 +144,7 @@ The API is called before a trip ends, so it can only use what is known at pickup
 
 Not used: `tpep_dropoff_datetime` (it defines the target), and all fare, tip, toll, surcharge and `payment_type` columns, because they are only known after the trip.
 
-**Limitation to document in the results:** `trip_distance` is measured by the meter during the trip, so strictly it is not known at pickup. It is the strongest predictor, so the baseline uses it, but the final write-up should say so, and the model can be compared against a version without it.
+**Limitation:** `trip_distance` is measured by the meter during the trip, so strictly it is not known at pickup. It is the strongest predictor, so the baseline uses it. The consequence is described under [Trade-offs and limitations](#trade-offs-and-limitations).
 
 ### Step 2: Data pipeline (`src/taxi_ml/`) and tests
 
@@ -124,7 +177,7 @@ After the first version of the pipeline the decisions were checked again against
 
 | Question | Finding | Decision |
 |---|---|---|
-| Drop the 15.5% rows with five empty fields? | They are not random: all have `payment_type = 0` (listed as a flex-fare trip in the TLC data dictionary, to be confirmed there), cluster in the evening and at night, and are a bit longer (median duration 13.7 vs 11.3 min, distance 2.25 vs 1.61 miles). 10% of them fail the other cleaning rules, against 3% of the rest | **Keep** them: only `passenger_count` is affected and it is probably a weak feature, and the model should know this group because the API will be asked about it. Training compares keeping vs dropping them (see next steps) |
+| Drop the 15.5% rows with five empty fields? | They are not random: all have `payment_type = 0` (listed as a flex-fare trip in the TLC data dictionary, to be confirmed there), cluster in the evening and at night, and are a bit longer (median duration 13.7 vs 11.3 min, distance 2.25 vs 1.61 miles). 10% of them fail the other cleaning rules, against 3% of the rest | **Keep** them: only `passenger_count` is affected and it is probably a weak feature, and the model should know this group because the API will be asked about it. The keep-vs-drop comparison on the same validation rows was not run, see [Open points](#open-points-and-what-i-would-do-differently) |
 | Duration cutoff | After the other rules, 60 min keeps 99.07% of trips, 90 min keeps 99.86%. Trips over 60 min are real (median distance 17 miles), not errors | **Keep 60 min.** It is a scope choice: the model is meant for trips up to one hour, and RMSE values are only comparable with the same cutoff |
 | Extreme distance | The 100-mile cap is loose (99.9th percentile: 27 miles). Speed is the better check: 186 trips are faster than 80 mph (median 123 mph, impossible), 10,935 are slower than 0.5 mph | **New rule:** drop speed above 80 mph (185 rows in the pipeline). Slow trips are kept: their duration is still a real observation |
 | Fare and total outliers | They are neither target nor features, so they cannot affect the model. Rows with `total_amount <= 0` (1.7%) have the same median duration, distance and speed as normal trips | Not cleaned |
@@ -161,7 +214,7 @@ uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000   # then op
 | **50 trees, leaf 100 (chosen)** | **12 s** | **57 MB** | **4.14** |
 | 100 trees, leaf 200 | 21 s | 56 MB | 4.23 |
 
-A bigger forest gains about 0.2 minutes of RMSE for 4 to 10 times the model size, so the baseline takes the small one. This is exactly what the hyperparameter tuning stretch task can revisit. (These checks were quick comparisons, not MLflow runs. Choosing on the validation set makes its RMSE slightly optimistic; there is no separate test set.)
+A bigger forest gains about 0.2 minutes of RMSE for 4 to 10 times the model size, so the baseline takes the small one. Hyperparameter tuning would revisit exactly this trade-off, but it was not done. (These checks were quick comparisons, not MLflow runs. Choosing on the validation set makes its RMSE slightly optimistic; there is no separate test set.)
 
 **Result (January 2025, validation set):**
 
@@ -187,7 +240,7 @@ The model's typical error is about 4 minutes on trips with a median of 11.7 minu
 
 **Tests** (`tests/test_train.py`, 17 tests): the split has the right sizes, no overlap, aligned features and target, and is reproducible; RMSE matches a hand calculation; the model is fitted, takes parameter overrides and beats the mean predictor on data where duration depends on distance; the full `run()` logs the expected parameters and metrics to a temporary MLflow, creates the database and model files in the folder it was given, puts two runs in one experiment, and the logged model can be loaded and predicts. A missing processed file gives an error that points to the pipeline.
 
-**Not done yet (after step 6):** keeping vs dropping the rows with a missing `passenger_count` (compare both on the same validation rows), a version without `trip_distance`, feature importances, and a time-based split.
+**Not done:** see [Open points](#open-points-and-what-i-would-do-differently).
 
 ### Step 4: Behavioral tests of the trained model (`tests/test_model_behavior.py`)
 
@@ -293,7 +346,43 @@ requests.post("http://127.0.0.1:8000/predict", json=json.load(open("sample-reque
 
 **Tests** (`tests/test_api.py`, 27): the happy path and response shape; the default passenger count; the edges of every valid range are accepted and values just outside are rejected; missing fields, wrong types, bad dates and unknown fields give `422` and never reach the model; the feature-equality test between pipeline and API; the app refuses to start without a model; the model is loaded once for several requests; and one smoke test with the real promoted model (skipped if none exists).
 
+## Trade-offs and limitations
+
+| Topic | What was decided | Consequence |
+|---|---|---|
+| **`trip_distance` is a feature** | It is by far the strongest predictor (correlation 0.81 with duration), but the meter only knows it at the end of the trip | The 4.14 min RMSE is what the model achieves **when the distance is known**. A real "predict before the ride" service would need a routing estimate of the distance, and its error would add to the model's. A model without distance was not compared |
+| **Small trees on purpose** | 50 trees with `min_samples_leaf=100`: 57 MB, 12 s to fit | About 0.2 min worse RMSE than a 569 MB forest in a quick check; the small model loads fast in the API |
+| **Trips of 1 to 60 minutes only** | Longer trips are real (median distance 17 miles) but were cut as a scope decision | The model is meant for trips up to an hour, and RMSE only compares between runs with the same cutoff |
+| **The 15.5% rows with missing fields are kept** | They are a different kind of trip (`payment_type = 0`), and only `passenger_count` is affected, filled with 1 | A guess for one weak feature; the alternative (dropping them) was not compared |
+| **Random split, one month, no test set** | 80/20 split of January 2025; the best run is also chosen on the validation set | The reported RMSE is slightly optimistic, and it says nothing about other months (seasonality, weather, events) |
+| **Fare and tip columns are ignored** | They are known only after the trip | The inconsistent amount columns were not investigated (as in the Green Taxi project, a question for the data owner) |
+| **Local-first deployment** | Plain `uvicorn`, one process, no authentication, MLflow files on the local disk | Fine for one machine; see the Docker note below for what deployment elsewhere needs |
+| **Promotion is manual** | `promote` picks the lowest validation RMSE and the behavioral tests are run by hand first | A worse model can never silently replace the served one; the cost is one extra command |
+
+## Open points and what I would do differently
+
+**Stretch tasks and experiments, and their status**
+
+| Task | Status |
+|---|---|
+| Test the data pipeline, model and API | Done: 103 tests (unit, integration, behavioral) |
+| Hyperparameter tuning (`GridSearchCV` or Optuna) | **Not done** (skipped for time). The quick comparison in step 3 suggests a bigger forest gains only about 0.2 minutes |
+| Compare the tuned model against the baseline | **Not done**; needs the tuning first |
+| Keep vs drop the rows with a missing `passenger_count` | **Not done** |
+| Model without `trip_distance` | **Not done** |
+
+**With more time, in this order**
+1. **A model that is honest about distance:** compare against a version without `trip_distance` (or with a routing estimate), to know the real "before the ride" error.
+2. **Tuning:** `Optuna` runs logged to MLflow, compared with the baseline, with a written answer on whether the extra complexity pays off.
+3. **Better evaluation:** a time-based split (validate on the last days), a separate test set, and more months of data.
+4. **Keep-vs-drop experiment** for the rows with missing fields, and confirm in the TLC data dictionary that `payment_type = 0` is a flex-fare trip.
+5. **Docker:** package the API as an image. One catch found while planning: MLflow stores absolute file paths (`file:///C:/Users/...`) in `mlflow.db`, so mounting it into a Linux container does not work. The clean way is an export step that saves the promoted model as a plain file and bakes it into the image. The single dependency list (MLflow, Optuna and others) would make the first image over 1 GB, so a smaller serving-only dependency group would be part of it.
+6. **Smaller gaps:** the real download is not covered by a test (it would need a mocked HTTP response), and the API has no batch endpoint.
+
 ## Questions from the assignment
 
-1. What is the RMSE of your final model? *(baseline so far: 4.14 minutes on the validation set; to be updated after tuning)*
-2. What would you do differently if you had more time? *(to be answered at the end)*
+**1. What is the RMSE of your final model?**
+**4.14 minutes** on the validation set (667,780 January 2025 trips of 1 to 60 minutes), against 9.77 minutes for always predicting the average duration. The training RMSE is 4.11, so the model does not overfit. This is the baseline Random Forest; no tuned model exists. The number assumes the trip distance is known (see the limitation above) and is slightly optimistic because there is no separate test set.
+
+**2. What would you do differently if you had more time?**
+First, check how much of the model's accuracy comes from `trip_distance` and what the error is without it, because that decides whether the service is useful before a ride starts. Second, tune the Random Forest with Optuna, log every trial to MLflow, and compare it against the baseline to see whether the extra complexity pays off. Third, evaluate more honestly with a time-based split, a separate test set and more months of data. Fourth, run the keep-vs-drop comparison for the rows with missing fields. Finally, package the API with Docker using an exported model file. The full list with reasons is under [Open points](#open-points-and-what-i-would-do-differently).
