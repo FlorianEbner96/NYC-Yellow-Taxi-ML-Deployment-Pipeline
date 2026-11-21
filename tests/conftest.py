@@ -19,6 +19,7 @@ def raw_trips() -> pd.DataFrame:
                     "2025-01-09 13:00",  # 7 distance 101
                     "2024-12-31 23:50",  # 8 pickup before January
                     "2025-02-01 00:00",  # 9 pickup in February (end is exclusive)
+                    "2025-01-10 08:00",  # 10 speed 240 mph (40 miles in 10 min)
                 ]
             ),
             "tpep_dropoff_datetime": pd.to_datetime(
@@ -33,11 +34,12 @@ def raw_trips() -> pd.DataFrame:
                     "2025-01-09 13:30",
                     "2025-01-01 00:10",
                     "2025-02-01 00:10",
+                    "2025-01-10 08:10",
                 ]
             ),
-            "passenger_count": [1.0, 2.0, None, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            "trip_distance": [2.0, 8.0, 3.0, 1.0, 1.0, 1.0, 0.0, 101.0, 1.0, 1.0],
-            "PULocationID": [161, 132, 237, 1, 1, 1, 1, 1, 1, 1],
-            "DOLocationID": [236, 230, 238, 1, 1, 1, 1, 1, 1, 1],
+            "passenger_count": [1.0, 2.0, None, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            "trip_distance": [2.0, 8.0, 3.0, 1.0, 1.0, 1.0, 0.0, 101.0, 1.0, 1.0, 40.0],
+            "PULocationID": [161, 132, 237, 1, 1, 1, 1, 1, 1, 1, 1],
+            "DOLocationID": [236, 230, 238, 1, 1, 1, 1, 1, 1, 1, 1],
         }
     )

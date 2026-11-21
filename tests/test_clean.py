@@ -55,3 +55,17 @@ def test_clean_on_an_empty_frame_returns_an_empty_frame(raw_trips):
     out = clean(raw_trips.iloc[0:0])
     assert out.empty
     assert "duration" in out.columns
+
+
+def test_clean_drops_trips_faster_than_80_mph(raw_trips):
+    assert 10 not in clean(raw_trips).index
+
+
+def test_clean_keeps_a_trip_at_exactly_80_mph(raw_trips):
+    raw_trips.loc[1, "trip_distance"] = 40.0  # 40 miles in 30 min = 80 mph
+    assert 1 in clean(raw_trips).index
+
+
+def test_clean_drops_a_trip_just_above_80_mph(raw_trips):
+    raw_trips.loc[1, "trip_distance"] = 40.01
+    assert 1 not in clean(raw_trips).index

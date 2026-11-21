@@ -6,6 +6,7 @@ from taxi_ml.config import (
     DROPOFF_COL,
     MAX_DISTANCE_MILES,
     MAX_DURATION_MIN,
+    MAX_SPEED_MPH,
     MIN_DURATION_MIN,
     PICKUP_COL,
     TARGET,
@@ -32,5 +33,7 @@ def clean(df: pd.DataFrame, start: str = "2025-01-01", end: str = "2025-02-01") 
         & out[TARGET].between(MIN_DURATION_MIN, MAX_DURATION_MIN)
         & (out["trip_distance"] > 0)
         & (out["trip_distance"] <= MAX_DISTANCE_MILES)
+        # speed <= max, written without dividing: distance <= max_speed * hours
+        & (out["trip_distance"] <= MAX_SPEED_MPH * out[TARGET] / 60)
     )
     return out[keep]

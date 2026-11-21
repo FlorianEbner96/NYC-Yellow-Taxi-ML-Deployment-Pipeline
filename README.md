@@ -6,7 +6,7 @@ Stack: `pandas` (data pipeline), `scikit-learn` `RandomForestRegressor` (model),
 The assignment is in [project-description.md](project-description.md).
 
 > This README is written step by step while the project is built. Each section below documents one step: what was done, why, and what came out.
-> **Status:** step 1 (exploration) and step 2 (data pipeline + tests) done. Next: model training, then API.
+> **Status:** step 1 (exploration), step 2 (data pipeline + tests) and step 3 (baseline training, RMSE, MLflow) done. Next: build the API, then the stretch tasks.
 
 ## Setup
 
@@ -23,6 +23,8 @@ Open notebooks with the kernel from `.venv/` that `uv sync` creates.
 ```
 data/raw/               downloaded parquet files, never edited (ignored by git)
 data/processed/         cleaned features + target, written by the pipeline (ignored by git)
+mlflow.db               MLflow runs, params and metrics (SQLite, ignored by git)
+mlartifacts/            logged models (ignored by git)
 notebooks/
   01_explore_yellow_taxi.ipynb   exploration only, not part of the pipeline
 src/taxi_ml/
@@ -31,12 +33,14 @@ src/taxi_ml/
   clean.py              add_duration() and clean(): the target and the row filters
   features.py           build_features(): raw columns -> model features (shared with the API)
   pipeline.py           build_dataset() and run(): all stages in order
+  train.py              split, baseline RandomForestRegressor, RMSE, MLflow logging
 app/                    (planned) FastAPI app
 tests/
   conftest.py           small raw-like test frame where each bad row breaks one rule
   test_clean.py         unit tests for the cleaning rules
   test_features.py      unit tests for feature building
   test_pipeline.py      integration tests: load, download-skip, full run on a parquet file
+  test_train.py         unit tests (split, RMSE, model) and integration tests (a run logged to a temporary MLflow)
 ```
 
 This table is updated whenever a file is added.
@@ -85,10 +89,10 @@ The notebook's decisions are now code. The flow is `download -> load -> clean ->
 
 ```bash
 uv run python -m taxi_ml.pipeline   # download (skipped if present), clean, write the processed file
-uv run pytest                       # 22 tests
+uv run pytest                       # all tests (42 after step 3)
 ```
 
-**Result on January 2025:** 3,475,226 raw rows -> **3,339,084 rows kept (96.1%)**. The processed file has the 6 features plus `duration`, no missing values, durations from 1 to 60 minutes. (The notebook's 82.1% figure dropped rows with a missing `passenger_count`; the pipeline keeps and fills them.)
+**Result on January 2025:** 3,475,226 raw rows -> **3,338,899 rows kept (96.1%)**. The processed file has the 6 features plus `duration`, no missing values, durations from 1 to 60 minutes. (The notebook's 82.1% figure dropped rows with a missing `passenger_count`; the pipeline keeps and fills them.)
 
 **Design decisions**
 
@@ -102,16 +106,80 @@ uv run pytest                       # 22 tests
 | `build_dataset()` (pure) is separate from `run()` (file access) | The integration test can check the logic without touching `data/` |
 | No Prefect or Docker in the pipeline | One month on one machine; not needed for this task |
 
-**Cleaning rules** (thresholds in `config.py`): pickup in `[2025-01-01, 2025-02-01)`; duration 1 to 60 minutes inclusive; distance above 0 and at most 100 miles. Nothing else is dropped.
+**Cleaning rules** (thresholds in `config.py`): pickup in `[2025-01-01, 2025-02-01)`; duration 1 to 60 minutes inclusive; distance above 0 and at most 100 miles; average speed at most 80 mph. Nothing else is dropped.
+
+#### Review of the cleaning decisions (speed rule added)
+
+After the first version of the pipeline the decisions were checked again against the data. The evidence is in notebook sections 6 to 9.
+
+| Question | Finding | Decision |
+|---|---|---|
+| Drop the 15.5% rows with five empty fields? | They are not random: all have `payment_type = 0` (listed as a flex-fare trip in the TLC data dictionary, to be confirmed there), cluster in the evening and at night, and are a bit longer (median duration 13.7 vs 11.3 min, distance 2.25 vs 1.61 miles). 10% of them fail the other cleaning rules, against 3% of the rest | **Keep** them: only `passenger_count` is affected and it is probably a weak feature, and the model should know this group because the API will be asked about it. Training compares keeping vs dropping them (see next steps) |
+| Duration cutoff | After the other rules, 60 min keeps 99.07% of trips, 90 min keeps 99.86%. Trips over 60 min are real (median distance 17 miles), not errors | **Keep 60 min.** It is a scope choice: the model is meant for trips up to one hour, and RMSE values are only comparable with the same cutoff |
+| Extreme distance | The 100-mile cap is loose (99.9th percentile: 27 miles). Speed is the better check: 186 trips are faster than 80 mph (median 123 mph, impossible), 10,935 are slower than 0.5 mph | **New rule:** drop speed above 80 mph (185 rows in the pipeline). Slow trips are kept: their duration is still a real observation |
+| Fare and total outliers | They are neither target nor features, so they cannot affect the model. Rows with `total_amount <= 0` (1.7%) have the same median duration, distance and speed as normal trips | Not cleaned |
+| Passenger count 0 or above 6 | Only 8 rows above 6 remain after cleaning. The field is typed in by the driver (17k trips show 5 passengers, 12k show 6) | Not cleaned. The API will accept 1 to 6 |
+
+The speed rule is written as `trip_distance <= 80 * duration / 60` (no division, so no division by zero). It uses information from after the trip, so it only cleans the training data and is never a feature.
 
 **Tests**
 
 - *Unit* (`test_clean.py`, `test_features.py`): each cleaning rule has its own test on a small frame where one row breaks exactly that rule, including the boundary (exactly 60 minutes is kept), a trip crossing midnight, the empty frame, and that inputs are not modified. Feature tests check the column order, hour/weekday, the passenger fill, and that no after-the-trip column (dropoff time, `total_amount`, `duration`) can leak into the features.
 - *Integration* (`test_pipeline.py`): reads a real parquet file, checks the clear error for a missing file, that an existing file is not downloaded again (the URL is unreachable on purpose), that `build_dataset` returns matching `X` and `y`, and that `run()` writes the processed file with the right columns.
+- Speed rule: a 240 mph trip is dropped, exactly 80 mph (40 miles in 30 min) is kept, 40.01 miles in 30 min is dropped.
 - Checked that the tests can fail: changing the maximum duration from 60 to 61 makes 4 tests fail.
 - The real download over the network is not covered by a test (it would need the network or a mocked HTTP response).
 
+### Step 3: Baseline model, RMSE and MLflow (`src/taxi_ml/train.py`)
+
+```bash
+uv run python -m taxi_ml.pipeline    # once: creates the processed file
+uv run python -m taxi_ml.train       # split, train, evaluate, log to MLflow (about 20 s)
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000   # then open http://127.0.0.1:5000
+```
+
+`train.py` has one function per stage so each can be tested alone: `load_processed()` -> `split_data()` -> `train_baseline()` -> `rmse()`, and `run()` which connects them and logs one MLflow run (experiment `yellow-taxi-duration`, run `baseline-random-forest`).
+
+**Split:** random 80% train / 20% validation with a fixed seed (42): 2,671,119 training rows and 667,780 validation rows. The model never sees the validation rows while fitting. A random split is simplest for one month of data; a time-based split (validate on the last days) would be stricter and is a possible improvement.
+
+**Model:** `RandomForestRegressor` with 50 trees, `min_samples_leaf=100`, `max_samples=0.5` (each tree sees half of the rows). The default settings (unlimited tree depth on 2.7M rows) would give models of 500+ MB that are slow to log and to load in the API, so the trees are kept small on purpose. Quick checks on the validation rows, before choosing:
+
+| Settings | Fit time | Model size | Validation RMSE |
+|---|---|---|---|
+| 100 trees, leaf 20 | 26 s | 569 MB | 3.95 |
+| 50 trees, max depth 20, leaf 20 | 14 s | 217 MB | 3.99 |
+| **50 trees, leaf 100 (chosen)** | **12 s** | **57 MB** | **4.14** |
+| 100 trees, leaf 200 | 21 s | 56 MB | 4.23 |
+
+A bigger forest gains about 0.2 minutes of RMSE for 4 to 10 times the model size, so the baseline takes the small one. This is exactly what the hyperparameter tuning stretch task can revisit. (These checks were quick comparisons, not MLflow runs. Choosing on the validation set makes its RMSE slightly optimistic; there is no separate test set.)
+
+**Result (January 2025, validation set):**
+
+| | RMSE (minutes) |
+|---|---|
+| **Random Forest baseline, validation** | **4.144** |
+| Random Forest baseline, training | 4.111 |
+| Always predict the average duration (validation) | 9.767 |
+
+The model's typical error is about 4 minutes on trips with a median of 11.7 minutes, less than half the error of predicting the average. Training and validation RMSE are almost equal, so the model does not overfit; if anything it is held back by the small trees.
+
+**What is logged to MLflow:** all model parameters, `n_train`, `n_val`, the split seed, the feature list, the three RMSE values above (`rmse_val`, `rmse_train`, `rmse_val_mean_baseline`), and the model itself with an input example (signature). I checked that the local UI lists the run with these values.
+
+**MLflow decisions**
+
+| Decision | Why |
+|---|---|
+| SQLite database (`mlflow.db`) and `mlartifacts/` in the project folder, not the `./mlruns` folder suggested in the template | MLflow 3.17 refuses the `./mlruns` file store ("maintenance mode"). SQLite is the supported local option and what `mle-api-ml-deployment` uses |
+| The artifact folder is set explicitly when the experiment is created | Otherwise models are saved relative to wherever the command was started |
+| `skops_trusted_types=["sklearn.tree._tree.Tree"]` when logging | MLflow saves sklearn models with `skops` and refuses unknown types. Every tree model contains this one type; we train and load our own models, so we trust exactly this type and nothing else |
+| The input example is logged as floats | Integer columns in a model signature reject missing values when the API is called |
+| `rmse_val_mean_baseline` is logged | An RMSE alone says little; this gives the number to beat |
+
+**Tests** (`tests/test_train.py`, 17 tests): the split has the right sizes, no overlap, aligned features and target, and is reproducible; RMSE matches a hand calculation; the model is fitted, takes parameter overrides and beats the mean predictor on data where duration depends on distance; the full `run()` logs the expected parameters and metrics to a temporary MLflow, creates the database and model files in the folder it was given, puts two runs in one experiment, and the logged model can be loaded and predicts. A missing processed file gives an error that points to the pipeline.
+
+**Not done yet:** keeping vs dropping the rows with a missing `passenger_count` (compare both on the same validation rows), a version without `trip_distance`, feature importances, and a time-based split.
+
 ## Questions from the assignment
 
-1. What is the RMSE of your final model? *(to be answered after training)*
+1. What is the RMSE of your final model? *(baseline so far: 4.14 minutes on the validation set; to be updated after tuning)*
 2. What would you do differently if you had more time? *(to be answered at the end)*

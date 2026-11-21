@@ -169,3 +169,7 @@ cython_debug/
 
 # Raw taxi data (downloaded by the pipeline)
 data/
+
+# MLflow local store
+mlflow.db
+mlartifacts/

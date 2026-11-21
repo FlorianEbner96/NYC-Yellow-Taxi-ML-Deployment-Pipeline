@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from taxi_ml.clean import clean
-from taxi_ml.config import MONTH, PROCESSED_DIR, TARGET, YEAR
+from taxi_ml.config import MONTH, PROCESSED_DIR, PROCESSED_NAME, TARGET, YEAR
 from taxi_ml.data import download_month, load_raw
 from taxi_ml.features import build_features
 
@@ -26,7 +26,7 @@ def run(raw_path: Path | None = None, processed_dir: Path = PROCESSED_DIR) -> Pa
     X, y = build_dataset(raw)
 
     processed_dir.mkdir(parents=True, exist_ok=True)
-    out = processed_dir / f"yellow_{YEAR}-{MONTH:02d}_clean.parquet"
+    out = processed_dir / PROCESSED_NAME
     X.assign(**{TARGET: y}).reset_index(drop=True).to_parquet(out)
     print(f"{len(raw):,} raw rows -> {len(X):,} rows kept ({len(X) / len(raw):.1%}) -> {out}")
     return out
